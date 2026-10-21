@@ -98,6 +98,13 @@ class HomeIOGuard:
             # which is not I/O against the home.
             if metadata and (absolute == "/proc" or absolute.startswith("/proc" + os.sep)):
                 return
+            # Install-layout checkouts (repo directly under the Hermes home) probe
+            # <checkout parent>/manifest.json at import time (pm.environments payload
+            # detection). That file is install metadata, not Hermes state: reads and
+            # stats pass; any write into the real home still refuses below.
+            if not destructive and absolute == _normcase(os.fspath(
+                    Path(__file__).resolve().parents[2] / "manifest.json")):
+                return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
             # Resolving the root itself (get_default_hermes_root's relative_to

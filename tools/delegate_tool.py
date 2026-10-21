@@ -421,6 +421,31 @@ def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) ->
     }
 
 
+def _task_route_pin(value: Any) -> Optional[str]:
+    """Non-empty string pin after strip. Non-strings and blanks inherit the batch route."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _resolve_task_credentials(
+    task: dict[str, Any], creds: dict[str, Any], routing_cfg: dict[str, Any], parent_agent,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Batch creds, or a per-task overlay when ``provider``/``model`` is a non-empty string."""
+    pin_provider = _task_route_pin(task.get("provider"))
+    pin_model = _task_route_pin(task.get("model"))
+    if not pin_provider and not pin_model:
+        return creds, routing_cfg
+    overlay = dict(routing_cfg)
+    if pin_provider:
+        overlay["provider"] = pin_provider
+        overlay["base_url"] = ""
+    if pin_model:
+        overlay["model"] = pin_model
+    return _resolve_delegation_credentials(overlay, parent_agent), overlay
+
+
 def _build_children(
     task_list: list[dict[str, Any]], task_schemas: list[Optional[dict[str, Any]]], creds: dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: dict[str, Any],
@@ -430,7 +455,6 @@ def _build_children(
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
-    overrides = _credential_overrides(creds, routing_cfg)
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -438,11 +462,13 @@ def _build_children(
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
+            creds_i, routing_i = _resolve_task_credentials(t, creds, routing_cfg, parent_agent)
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=creds_i["model"], max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                **_credential_overrides(creds_i, routing_i),
             )
         except ValueError as exc:
             # An owner refusal can land mid-batch: the siblings built so far hold reservations.
@@ -660,7 +686,8 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Children inherit the parent model unless a task sets provider/model, or via "
+    "delegation.provider / delegation.model in config.yaml."
 )
 
 def _build_tasks_param_description() -> str:
@@ -754,6 +781,16 @@ DELEGATE_TASK_SCHEMA = {
                             "is enabled; otherwise the whole call returns as one message). Tasks sharing a group return "
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
+                        ),
+                        "provider": _p(
+                            "string",
+                            "Optional provider pin for THIS child only (named provider or a custom providers: table "
+                            "entry). Resolved like CLI/config. Unknown providers fail the spawn; omit or leave blank "
+                            "to inherit the batch/parent route.",
+                        ),
+                        "model": _p(
+                            "string",
+                            "Optional model pin for THIS child only. Omit or leave blank to inherit the batch/parent model.",
                         ),
                     },
                     "required": ["goal"],
